@@ -14,7 +14,7 @@ import time
 LON = "root@YOUR_LONDON_IP"
 SYD = "root@YOUR_SYDNEY_IP"
 
-def ssh(host, cmd, timeout=15):
+def ssh(host, cmd, timeout=30):
     r = subprocess.run(["ssh", host, cmd], capture_output=True, text=True, timeout=timeout)
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
@@ -29,13 +29,18 @@ def main():
     print(f"=== Netem Loss Test: {args.loss}% loss, {args.rate_mbps} Mbps, {args.duration}s ===")
 
     # Restart relays to reset flow_id counters
+    # Use systemd-run to launch relay as transient unit (survives SSH disconnect)
     print("Restarting relays...")
-    ssh(LON, "pkill -9 -f entrouter-line 2>/dev/null")
-    ssh(SYD, "pkill -9 -f entrouter-line 2>/dev/null")
-    time.sleep(2)
-    ssh(LON, "cd /opt/entrouter-line; RUST_LOG=info nohup ./target/release/entrouter-line > /tmp/relay.log 2>&1 &")
-    ssh(SYD, "cd /opt/entrouter-line; RUST_LOG=info nohup ./target/release/entrouter-line > /tmp/relay.log 2>&1 &")
+    ssh(LON, "systemctl stop entrouter-bench.service 2>/dev/null; fuser -k 4433/udp 2>/dev/null; fuser -k 8443/tcp 2>/dev/null; fuser -k 4434/udp 2>/dev/null; fuser -k 9090/tcp 2>/dev/null")
+    ssh(SYD, "systemctl stop entrouter-bench.service 2>/dev/null; fuser -k 4433/udp 2>/dev/null; fuser -k 8443/tcp 2>/dev/null; fuser -k 4434/udp 2>/dev/null; fuser -k 9090/tcp 2>/dev/null")
+    time.sleep(3)
+    ssh(LON, "systemctl reset-failed entrouter-bench.service 2>/dev/null; systemd-run --no-block --unit=entrouter-bench -E RUST_LOG=info -p WorkingDirectory=/opt/entrouter-line /opt/entrouter-line/target/release/entrouter-line")
+    ssh(SYD, "systemctl reset-failed entrouter-bench.service 2>/dev/null; systemd-run --no-block --unit=entrouter-bench -E RUST_LOG=info -p WorkingDirectory=/opt/entrouter-line /opt/entrouter-line/target/release/entrouter-line")
     time.sleep(4)
+    # Verify relays are running
+    out_lon, _, _ = ssh(LON, "systemctl is-active entrouter-bench.service")
+    out_syd, _, _ = ssh(SYD, "systemctl is-active entrouter-bench.service")
+    print(f"  London relay: {out_lon}, Sydney relay: {out_syd}")
 
     # Apply netem loss
     print(f"Applying {args.loss}% loss on both nodes...")
@@ -62,7 +67,10 @@ def main():
         print("Removing netem loss...")
         ssh(LON, "tc qdisc del dev enp1s0 root 2>/dev/null")
         ssh(SYD, "tc qdisc del dev enp1s0 root 2>/dev/null")
-        print("Netem removed.")
+        # Stop relay units
+        ssh(LON, "systemctl stop entrouter-bench.service 2>/dev/null")
+        ssh(SYD, "systemctl stop entrouter-bench.service 2>/dev/null")
+        print("Netem removed, relays stopped.")
 
 if __name__ == "__main__":
     main()

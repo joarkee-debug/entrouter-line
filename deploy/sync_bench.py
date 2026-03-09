@@ -40,20 +40,30 @@ def main():
     time.sleep(settle)
 
     # --- Handshake: exchange READY signals through the relay ---
-    sock.sendall(b"READY\n")
-    print(f"[{args.role}] sent READY, waiting for peer...")
-
+    # Retry READY to survive packet loss (UDP tunnel is unreliable)
+    sock.settimeout(2)
     buf = b""
-    while b"READY\n" not in buf:
+    for attempt in range(15):
+        sock.sendall(b"READY\n")
+        if attempt == 0:
+            print(f"[{args.role}] sent READY, waiting for peer...")
         try:
-            chunk = sock.recv(4096)
-            if not chunk:
-                print(f"[{args.role}] connection closed during handshake")
-                return
-            buf += chunk
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    print(f"[{args.role}] connection closed during handshake")
+                    return
+                buf += chunk
+                if b"READY\n" in buf:
+                    break
         except socket.timeout:
-            print(f"[{args.role}] TIMEOUT waiting for peer READY")
-            return
+            pass
+        if b"READY\n" in buf:
+            break
+    else:
+        print(f"[{args.role}] TIMEOUT waiting for peer READY after 15 attempts")
+        return
+    sock.settimeout(30)
 
     print(f"[{args.role}] peer READY received — starting benchmark")
     # Any leftover data after READY\n is the start of benchmark data
