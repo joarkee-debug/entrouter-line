@@ -2,13 +2,16 @@
 /// Receives packets from all tunnels, routes to destination or delivers locally.
 /// Supports multi-hop forwarding via mesh router's shortest-path algorithm.
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::mesh::probe::Prober;
 use crate::mesh::router::MeshRouter;
+use crate::relay::fec::FecConfig;
+use crate::relay::fec_codec::{FecReceiver, FecSender};
 use crate::relay::tunnel::{ReceivedPacket, Tunnel};
 use crate::relay::wire;
 
@@ -42,6 +45,9 @@ pub struct Forwarder {
     prober: Arc<Prober>,
     tunnels: DashMap<String, Arc<Tunnel>>,
     local_tx: mpsc::Sender<LocalDelivery>,
+    fec_config: FecConfig,
+    fec_senders: DashMap<String, Mutex<FecSender>>,
+    fec_receivers: DashMap<String, Mutex<FecReceiver>>,
 }
 
 impl Forwarder {
@@ -50,6 +56,7 @@ impl Forwarder {
         router: Arc<MeshRouter>,
         prober: Arc<Prober>,
         local_tx: mpsc::Sender<LocalDelivery>,
+        fec_config: FecConfig,
     ) -> Self {
         Self {
             node_id,
@@ -57,10 +64,19 @@ impl Forwarder {
             prober,
             tunnels: DashMap::new(),
             local_tx,
+            fec_config,
+            fec_senders: DashMap::new(),
+            fec_receivers: DashMap::new(),
         }
     }
 
     pub fn add_tunnel(&self, peer_id: String, tunnel: Arc<Tunnel>) {
+        self.fec_senders
+            .entry(peer_id.clone())
+            .or_insert_with(|| Mutex::new(FecSender::new(self.fec_config)));
+        self.fec_receivers
+            .entry(peer_id.clone())
+            .or_insert_with(|| Mutex::new(FecReceiver::new()));
         self.tunnels.insert(peer_id, tunnel);
     }
 
@@ -79,7 +95,19 @@ impl Forwarder {
                 self.prober.handle_pong(from_peer, &packet.payload);
             }
             wire::PACKET_DATA | wire::PACKET_PARITY => {
-                self.route_data(from_peer, &packet.payload).await;
+                // Route through FEC receiver to reassemble blocks
+                if let Some(receiver_lock) = self.fec_receivers.get(from_peer) {
+                    let mut receiver = receiver_lock.lock().await;
+                    if let Some(payloads) = receiver.receive_shard(&packet.payload) {
+                        drop(receiver); // release lock before routing
+                        for payload in payloads {
+                            self.route_data(from_peer, &payload).await;
+                        }
+                    }
+                } else {
+                    // No FEC receiver for this peer — pass through directly
+                    self.route_data(from_peer, &packet.payload).await;
+                }
             }
             wire::PACKET_CONTROL => {
                 debug!(from = %from_peer, "control packet received");
@@ -124,7 +152,8 @@ impl Forwarder {
         self.forward_to(dest_node, &payload).await
     }
 
-    /// Forward a relay payload to the next hop toward destination
+    /// Forward a relay payload to the next hop toward destination.
+    /// Buffers through FEC encoder — shards sent when block is full.
     async fn forward_to(&self, dest_node: &str, relay_payload: &[u8]) -> Result<(), ForwarderError> {
         let route = self
             .router
@@ -136,19 +165,73 @@ impl Forwarder {
             .get(&route.next_hop)
             .ok_or_else(|| ForwarderError::NoTunnel(route.next_hop.clone()))?;
 
-        tunnel
-            .send(wire::PACKET_DATA, relay_payload)
-            .await
-            .map_err(ForwarderError::SendFailed)
+        // Buffer through FEC sender
+        if let Some(sender_lock) = self.fec_senders.get(&route.next_hop) {
+            let mut sender = sender_lock.lock().await;
+            if let Some(shards) = sender.submit(relay_payload.to_vec()) {
+                drop(sender); // release lock before sending
+                for (ptype, shard) in shards {
+                    tunnel
+                        .send(ptype, &shard)
+                        .await
+                        .map_err(ForwarderError::SendFailed)?;
+                }
+            }
+        } else {
+            // No FEC sender — send directly
+            tunnel
+                .send(wire::PACKET_DATA, relay_payload)
+                .await
+                .map_err(ForwarderError::SendFailed)?;
+        }
+
+        Ok(())
     }
 
-    /// Run the main forwarding loop — receives from all peer receive loops
+    /// Run the main forwarding loop — receives from all peer receive loops.
+    /// Includes periodic FEC flush to send partial blocks.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<(String, ReceivedPacket)>) {
-        info!(node = %self.node_id, "forwarder started");
-        while let Some((from_peer, packet)) = rx.recv().await {
-            self.handle_inbound(&from_peer, packet).await;
+        info!(node = %self.node_id, "forwarder started (FEC: {}+{} shards)",
+            self.fec_config.data_shards, self.fec_config.parity_shards);
+        let mut flush_interval = tokio::time::interval(Duration::from_millis(5));
+
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some((from_peer, packet)) => {
+                            self.handle_inbound(&from_peer, packet).await;
+                        }
+                        None => break,
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    self.flush_fec().await;
+                }
+            }
         }
         info!("forwarder stopped");
+    }
+
+    /// Flush all partial FEC blocks and expire stale receive blocks.
+    async fn flush_fec(&self) {
+        // Flush partial send blocks
+        for entry in self.fec_senders.iter() {
+            let peer_id = entry.key().clone();
+            let mut sender = entry.value().lock().await;
+            if let Some(shards) = sender.flush_partial() {
+                if let Some(tunnel) = self.tunnels.get(&peer_id) {
+                    for (ptype, shard) in shards {
+                        let _ = tunnel.send(ptype, &shard).await;
+                    }
+                }
+            }
+        }
+        // Expire old incomplete receive blocks
+        for entry in self.fec_receivers.iter() {
+            let mut receiver = entry.value().lock().await;
+            receiver.expire_old(500); // 500ms max age
+        }
     }
 
     pub fn node_id(&self) -> &str {

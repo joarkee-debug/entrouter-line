@@ -41,6 +41,10 @@ pub struct MeshConfig {
 pub struct RelayConfig {
     /// Default destination node for edge traffic
     pub default_dest: String,
+    /// FEC data shards (N). Defaults to 10.
+    pub fec_data_shards: Option<usize>,
+    /// FEC parity shards (K). Defaults to 4.
+    pub fec_parity_shards: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

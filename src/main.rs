@@ -16,6 +16,7 @@ use entrouter_line::mesh::latency_matrix::LatencyMatrix;
 use entrouter_line::mesh::probe::Prober;
 use entrouter_line::mesh::router::MeshRouter;
 use entrouter_line::relay::crypto::TunnelCrypto;
+use entrouter_line::relay::fec::FecConfig;
 use entrouter_line::relay::forwarder::{Forwarder, LocalDelivery};
 use entrouter_line::relay::tunnel::{self, ReceivedPacket, Tunnel};
 
@@ -67,11 +68,17 @@ async fn main() {
     // Local delivery channel (forwarder → edge)
     let (local_tx, local_rx) = mpsc::channel::<LocalDelivery>(4096);
 
+    let fec_config = FecConfig {
+        data_shards: config.relay.fec_data_shards.unwrap_or(10),
+        parity_shards: config.relay.fec_parity_shards.unwrap_or(4),
+    };
+
     let forwarder = Arc::new(Forwarder::new(
         config.node_id.clone(),
         Arc::clone(&router),
         Arc::clone(&prober),
         local_tx,
+        fec_config,
     ));
 
     // Forwarding event channel (receive loop → forwarder)
