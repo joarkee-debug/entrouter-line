@@ -1,5 +1,7 @@
+use base64::Engine;
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -7,10 +9,38 @@ pub struct Config {
     pub node_id: String,
     /// Region label (e.g. "syd", "lon", "sgp")
     pub region: String,
-    /// Address to listen on for incoming relay traffic
-    pub listen_addr: SocketAddr,
+    /// Network listener configuration
+    pub listen: ListenConfig,
+    /// Mesh routing configuration
+    pub mesh: MeshConfig,
+    /// Relay configuration
+    pub relay: RelayConfig,
     /// Known peer PoP nodes
     pub peers: Vec<PeerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListenConfig {
+    /// UDP address for tunnel relay traffic
+    pub relay_addr: SocketAddr,
+    /// TCP address for edge user-facing traffic
+    pub tcp_addr: SocketAddr,
+    /// QUIC address for edge user-facing traffic
+    pub quic_addr: SocketAddr,
+    /// Admin HTTP address
+    pub admin_addr: SocketAddr,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MeshConfig {
+    /// Probe interval in milliseconds
+    pub probe_interval_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RelayConfig {
+    /// Default destination node for edge traffic
+    pub default_dest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -18,4 +48,73 @@ pub struct PeerConfig {
     pub node_id: String,
     pub region: String,
     pub addr: SocketAddr,
+    /// Base64-encoded 32-byte shared key
+    pub shared_key: String,
+}
+
+impl Config {
+    /// Load configuration from a TOML file
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
+        let config: Config =
+            toml::from_str(&content).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.node_id.is_empty() {
+            return Err(ConfigError::Validation("node_id cannot be empty".into()));
+        }
+        if self.peers.is_empty() {
+            return Err(ConfigError::Validation("at least one peer required".into()));
+        }
+        for peer in &self.peers {
+            let key_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&peer.shared_key)
+                .map_err(|_| {
+                    ConfigError::Validation(format!(
+                        "invalid base64 shared_key for peer {}",
+                        peer.node_id
+                    ))
+                })?;
+            if key_bytes.len() != 32 {
+                return Err(ConfigError::Validation(format!(
+                    "shared_key for peer {} must be 32 bytes (got {})",
+                    peer.node_id,
+                    key_bytes.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PeerConfig {
+    /// Decode the shared key from base64
+    pub fn decode_key(&self) -> [u8; 32] {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.shared_key)
+            .expect("invalid base64 key");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        key
+    }
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Io(std::io::Error),
+    Parse(String),
+    Validation(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "config I/O error: {e}"),
+            Self::Parse(e) => write!(f, "config parse error: {e}"),
+            Self::Validation(e) => write!(f, "config validation: {e}"),
+        }
+    }
 }

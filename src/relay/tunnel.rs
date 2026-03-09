@@ -1,7 +1,9 @@
 /// Pre-warmed encrypted UDP tunnel between PoPs.
 /// Combines wire framing, ChaCha20-Poly1305 encryption, and adaptive FEC.
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use dashmap::DashMap;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{info, warn, debug};
@@ -15,7 +17,7 @@ pub struct Tunnel {
     pub peer_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     crypto: TunnelCrypto,
-    tx_seq: u16,
+    tx_seq: AtomicU16,
 }
 
 /// Received and decrypted payload from the tunnel.
@@ -32,14 +34,13 @@ impl Tunnel {
             peer_addr,
             socket,
             crypto: TunnelCrypto::new(key),
-            tx_seq: 0,
+            tx_seq: AtomicU16::new(0),
         }
     }
 
     /// Send a payload through the tunnel (encrypt + frame + UDP send).
-    pub async fn send(&mut self, packet_type: u8, payload: &[u8]) -> std::io::Result<()> {
-        let seq = self.tx_seq;
-        self.tx_seq = self.tx_seq.wrapping_add(1);
+    pub async fn send(&self, packet_type: u8, payload: &[u8]) -> std::io::Result<()> {
+        let seq = self.tx_seq.fetch_add(1, Ordering::Relaxed);
 
         // Encrypt payload
         let ciphertext = self.crypto.encrypt(seq, payload);
@@ -57,7 +58,7 @@ impl Tunnel {
 
     /// Send a FEC-encoded block of data through the tunnel.
     /// Splits `data` into `data_shards` chunks, generates parity, sends all.
-    pub async fn send_with_fec(&mut self, data: &[u8], fec_config: FecConfig) -> std::io::Result<()> {
+    pub async fn send_with_fec(&self, data: &[u8], fec_config: FecConfig) -> std::io::Result<()> {
         let encoder = FecEncoder::new(fec_config);
         let shard_size = (data.len() + fec_config.data_shards - 1) / fec_config.data_shards;
 
@@ -164,6 +165,64 @@ pub async fn receive_loop(
                 parity_shards = rec.parity_shards,
                 "FEC recommendation"
             );
+        }
+    }
+}
+
+/// Multiplexed receive loop — handles encrypted packets from all peers on a shared socket.
+/// Identifies sender by source address, decrypts with the corresponding key.
+pub async fn receive_loop_multi(
+    socket: Arc<UdpSocket>,
+    peers: Arc<DashMap<SocketAddr, (String, TunnelCrypto)>>,
+    tx: mpsc::Sender<(String, ReceivedPacket)>,
+) {
+    let mut buf = [0u8; wire::MAX_PACKET];
+
+    loop {
+        let (len, from) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("recv error: {e}");
+                continue;
+            }
+        };
+
+        if len < wire::HEADER_SIZE {
+            continue;
+        }
+
+        let (packet_type, seq, payload_len) = wire::decode_header(&buf);
+        let ct_start = wire::HEADER_SIZE;
+        let ct_end = ct_start + payload_len as usize;
+
+        if ct_end > len {
+            continue;
+        }
+
+        let Some(peer) = peers.get(&from) else {
+            debug!(from = %from, "packet from unknown peer");
+            continue;
+        };
+
+        let (peer_id, crypto) = peer.value();
+        let ciphertext = &buf[ct_start..ct_end];
+
+        match crypto.decrypt(seq, ciphertext) {
+            Ok(plaintext) => {
+                let pkt = ReceivedPacket {
+                    packet_type,
+                    seq,
+                    payload: plaintext,
+                    from,
+                };
+                if tx.send((peer_id.clone(), pkt)).await.is_err() {
+                    info!("forwarding channel closed, stopping");
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!(seq, from = %from, "decrypt failed: {e}");
+            }
         }
     }
 }

@@ -1,9 +1,32 @@
-mod config;
-mod edge;
-mod mesh;
-mod relay;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use clap::Parser;
+use dashmap::DashMap;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+use entrouter_line::admin;
+use entrouter_line::config::Config;
+use entrouter_line::edge::quic_acceptor::{self, QuicAcceptor};
+use entrouter_line::edge::tcp_split::TcpSplitter;
+use entrouter_line::mesh::latency_matrix::LatencyMatrix;
+use entrouter_line::mesh::probe::Prober;
+use entrouter_line::mesh::router::MeshRouter;
+use entrouter_line::relay::crypto::TunnelCrypto;
+use entrouter_line::relay::forwarder::{Forwarder, LocalDelivery};
+use entrouter_line::relay::tunnel::{self, ReceivedPacket, Tunnel};
+
+#[derive(Parser)]
+#[command(name = "entrouter-line")]
+#[command(about = "Zero-loss cross-region packet relay")]
+struct Cli {
+    /// Path to config file
+    #[arg(short, long, default_value = "config.toml")]
+    config: PathBuf,
+}
 
 #[tokio::main]
 async fn main() {
@@ -11,9 +34,163 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("entrouter-line starting");
+    let cli = Cli::parse();
+    info!("entrouter-line starting");
 
-    // TODO: Load config, init tunnels, start relay
+    // Load config
+    let config = match Config::load(&cli.config) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    info!(node = %config.node_id, region = %config.region, "config loaded");
+
+    // --- Bind UDP socket for tunnel relay traffic ---
+    let udp_socket = Arc::new(
+        UdpSocket::bind(config.listen.relay_addr)
+            .await
+            .expect("failed to bind UDP socket"),
+    );
+    info!(addr = %config.listen.relay_addr, "UDP relay bound");
+
+    // --- Core components ---
+    let matrix = Arc::new(LatencyMatrix::new());
+    let router = Arc::new(MeshRouter::new(
+        config.node_id.clone(),
+        Arc::clone(&matrix),
+    ));
+    let prober = Arc::new(Prober::new(config.node_id.clone(), Arc::clone(&matrix)));
+
+    // Local delivery channel (forwarder → edge)
+    let (local_tx, local_rx) = mpsc::channel::<LocalDelivery>(4096);
+
+    let forwarder = Arc::new(Forwarder::new(
+        config.node_id.clone(),
+        Arc::clone(&router),
+        Arc::clone(&prober),
+        local_tx,
+    ));
+
+    // Forwarding event channel (receive loop → forwarder)
+    let (fwd_tx, fwd_rx) = mpsc::channel::<(String, ReceivedPacket)>(8192);
+
+    // --- Build peer map and create tunnels ---
+    let peer_crypto_map: Arc<DashMap<std::net::SocketAddr, (String, TunnelCrypto)>> =
+        Arc::new(DashMap::new());
+
+    for peer in &config.peers {
+        let key = peer.decode_key();
+
+        // Tunnel for sending
+        let tunnel = Arc::new(Tunnel::new(Arc::clone(&udp_socket), peer.addr, &key));
+        forwarder.add_tunnel(peer.node_id.clone(), Arc::clone(&tunnel));
+
+        // Register in peer crypto map for the multiplexed receive loop
+        peer_crypto_map.insert(peer.addr, (peer.node_id.clone(), TunnelCrypto::new(&key)));
+
+        // Start probe loop for this peer
+        let prober_clone = Arc::clone(&prober);
+        let tunnel_clone = Arc::clone(&tunnel);
+        let probe_interval = config.mesh.probe_interval_ms;
+        let peer_id = peer.node_id.clone();
+        tokio::spawn(async move {
+            prober_clone
+                .probe_loop(peer_id, tunnel_clone, probe_interval)
+                .await;
+        });
+
+        info!(peer = %peer.node_id, addr = %peer.addr, region = %peer.region, "tunnel ready");
+    }
+
+    // --- Start multiplexed receive loop (one loop for all peers) ---
+    let recv_socket = Arc::clone(&udp_socket);
+    let recv_tx = fwd_tx.clone();
+    tokio::spawn(async move {
+        tunnel::receive_loop_multi(recv_socket, peer_crypto_map, recv_tx).await;
+    });
+    drop(fwd_tx); // drop the extra sender so the forwarder loop can detect shutdown
+
+    // --- Start forwarder ---
+    let fwd_clone = Arc::clone(&forwarder);
+    tokio::spawn(async move {
+        fwd_clone.run(fwd_rx).await;
+    });
+
+    // --- TCP edge ---
+    let tcp_listener = TcpListener::bind(config.listen.tcp_addr)
+        .await
+        .expect("failed to bind TCP listener");
+    let tcp_splitter = Arc::new(TcpSplitter::new(
+        Arc::clone(&forwarder),
+        config.relay.default_dest.clone(),
+    ));
+    info!(addr = %config.listen.tcp_addr, "TCP edge bound");
+
+    let tcp_clone = Arc::clone(&tcp_splitter);
+    tokio::spawn(async move {
+        tcp_clone.listen(tcp_listener).await;
+    });
+
+    // --- QUIC edge ---
+    let quic_server_config = quic_acceptor::make_server_config();
+    let quic_endpoint = quinn::Endpoint::server(quic_server_config, config.listen.quic_addr)
+        .expect("failed to create QUIC endpoint");
+    let quic_acceptor = Arc::new(QuicAcceptor::new(
+        Arc::clone(&forwarder),
+        config.relay.default_dest.clone(),
+    ));
+    info!(addr = %config.listen.quic_addr, "QUIC edge bound");
+
+    let quic_clone = Arc::clone(&quic_acceptor);
+    tokio::spawn(async move {
+        quic_clone.listen(quic_endpoint).await;
+    });
+
+    // --- Route local deliveries to edge (relay → TCP/QUIC clients) ---
+    let tcp_delivery = Arc::clone(&tcp_splitter);
+    let quic_delivery = Arc::clone(&quic_acceptor);
+    tokio::spawn(async move {
+        let mut local_rx = local_rx;
+        while let Some(delivery) = local_rx.recv().await {
+            // flow_id < 1_000_000 → TCP, >= 1_000_000 → QUIC
+            if delivery.flow_id < 1_000_000 {
+                tcp_delivery.deliver(delivery.flow_id, delivery.data);
+            } else {
+                quic_delivery.deliver(delivery.flow_id, delivery.data);
+            }
+        }
+    });
+
+    // --- Admin HTTP ---
+    let admin_state = Arc::new(admin::AdminState {
+        node_id: config.node_id.clone(),
+        region: config.region.clone(),
+        matrix: Arc::clone(&matrix),
+        forwarder: Arc::clone(&forwarder),
+        tcp_splitter: Arc::clone(&tcp_splitter),
+        quic_acceptor: Arc::clone(&quic_acceptor),
+    });
+    let admin_app = admin::admin_router(admin_state);
+    let admin_listener = TcpListener::bind(config.listen.admin_addr)
+        .await
+        .expect("failed to bind admin listener");
+    info!(addr = %config.listen.admin_addr, "admin HTTP bound");
+
+    tokio::spawn(async move {
+        axum::serve(admin_listener, admin_app).await.ok();
+    });
+
+    // --- Ready ---
+    info!(
+        node = %config.node_id,
+        region = %config.region,
+        peers = config.peers.len(),
+        "entrouter-line ready — all systems go"
+    );
+
     tokio::signal::ctrl_c().await.ok();
-    tracing::info!("shutting down");
+    info!("shutting down");
 }
