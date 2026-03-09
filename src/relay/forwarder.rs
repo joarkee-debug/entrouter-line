@@ -153,7 +153,7 @@ impl Forwarder {
     }
 
     /// Forward a relay payload to the next hop toward destination.
-    /// Buffers through FEC encoder — shards sent when block is full.
+    /// Buffers through FEC encoder — shards spawned as fire-and-forget when block is full.
     async fn forward_to(&self, dest_node: &str, relay_payload: &[u8]) -> Result<(), ForwarderError> {
         let route = self
             .router
@@ -170,12 +170,12 @@ impl Forwarder {
             let mut sender = sender_lock.lock().await;
             if let Some(shards) = sender.submit(relay_payload.to_vec()) {
                 drop(sender); // release lock before sending
-                for (ptype, shard) in shards {
-                    tunnel
-                        .send(ptype, &shard)
-                        .await
-                        .map_err(ForwarderError::SendFailed)?;
-                }
+                let tun = Arc::clone(&*tunnel);
+                tokio::spawn(async move {
+                    for (ptype, shard) in shards {
+                        let _ = tun.send(ptype, &shard).await;
+                    }
+                });
             }
         } else {
             // No FEC sender — send directly
@@ -201,6 +201,10 @@ impl Forwarder {
                     match msg {
                         Some((from_peer, packet)) => {
                             self.handle_inbound(&from_peer, packet).await;
+                            // Drain any queued packets to reduce select! overhead
+                            while let Ok((from_peer, packet)) = rx.try_recv() {
+                                self.handle_inbound(&from_peer, packet).await;
+                            }
                         }
                         None => break,
                     }
@@ -221,9 +225,12 @@ impl Forwarder {
             let mut sender = entry.value().lock().await;
             if let Some(shards) = sender.flush_partial() {
                 if let Some(tunnel) = self.tunnels.get(&peer_id) {
-                    for (ptype, shard) in shards {
-                        let _ = tunnel.send(ptype, &shard).await;
-                    }
+                    let tun = Arc::clone(&*tunnel);
+                    tokio::spawn(async move {
+                        for (ptype, shard) in shards {
+                            let _ = tun.send(ptype, &shard).await;
+                        }
+                    });
                 }
             }
         }

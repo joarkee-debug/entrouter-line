@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use dashmap::DashMap;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -49,13 +50,22 @@ async fn main() {
 
     info!(node = %config.node_id, region = %config.region, "config loaded");
 
-    // --- Bind UDP socket for tunnel relay traffic ---
-    let udp_socket = Arc::new(
-        UdpSocket::bind(config.listen.relay_addr)
-            .await
-            .expect("failed to bind UDP socket"),
-    );
-    info!(addr = %config.listen.relay_addr, "UDP relay bound");
+    // --- Bind UDP socket for tunnel relay traffic (large buffers for burst absorption) ---
+    let udp_socket = {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .expect("failed to create UDP socket");
+        sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
+        sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+        sock.set_nonblocking(true)
+            .expect("failed to set nonblocking");
+        sock.bind(&config.listen.relay_addr.into())
+            .expect("failed to bind UDP socket");
+        let std_sock: std::net::UdpSocket = sock.into();
+        Arc::new(
+            UdpSocket::from_std(std_sock).expect("failed to create tokio UdpSocket"),
+        )
+    };
+    info!(addr = %config.listen.relay_addr, "UDP relay bound (4MB buffers)");
 
     // --- Core components ---
     let matrix = Arc::new(LatencyMatrix::new());
