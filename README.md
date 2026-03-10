@@ -14,15 +14,15 @@ Adaptive FEC, encrypted UDP tunnels, real-time latency-mesh routing, and QUIC 0-
 
 Relays packets between globally distributed PoP (Point of Presence) nodes with:
 
-- **Zero packet loss up to 10% link loss** — adaptive Reed-Solomon FEC absorbs all loss with zero throughput impact
-- **Zero relay overhead** — measured loss exactly matches simulated network loss, the relay adds nothing
+- **Zero packet loss up to 10% link loss** adaptive Reed-Solomon FEC absorbs all loss with zero throughput impact
+- **Zero relay overhead** measured loss exactly matches simulated network loss, the relay adds nothing
 - **Optimal routing** via real-time latency mesh with Dijkstra shortest-path (not BGP)
 - **Instant connections** via QUIC 0-RTT + TCP splitting at edge
 - **Always-encrypted** tunnels with ChaCha20-Poly1305
 
 ## Benchmarks
 
-Tested on London ↔ Sydney (273ms RTT) over Vultr shared VPS — one of the longest internet routes on Earth, on budget infrastructure.
+Tested on London ↔ Sydney (273ms RTT) over Vultr shared VPS, one of the longest internet routes on Earth, on budget infrastructure.
 
 ### FEC Loss Recovery
 
@@ -101,8 +101,8 @@ openssl rand -base64 32
 ```
 
 The admin API is available at `http://127.0.0.1:9090`:
-- `GET /health` — liveness check
-- `GET /status` — peer connections, latency matrix, routing table
+- `GET /health`  liveness check
+- `GET /status`  peer connections, latency matrix, routing table
 
 ---
 
